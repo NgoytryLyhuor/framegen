@@ -7,6 +7,11 @@ export interface ProcessRequest {
   fileName: string;
 }
 
+export interface ProbeRequest {
+  type: 'probe';
+  buffer: ArrayBuffer;
+}
+
 export type WorkerProgress = {
   type: 'progress';
   stage: 'decode' | 'interpolate' | 'encode';

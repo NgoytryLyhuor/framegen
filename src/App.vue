@@ -18,15 +18,15 @@
 
   <div v-if="webgpu" class="controls card">
     <div class="field">
-      <span class="label">Make it this smooth</span>
+      <span class="label">{{ meta ? 'Your video' : probing ? 'Reading video…' : 'Make it this smooth' }}</span>
       <div class="factors">
         <button
           v-for="f in factors"
           :key="f"
           class="factor"
-          :class="{ active: factor === f }"
-          :disabled="phase === 'running'"
-          :title="`Smoothness ×${f}: ${meta ? `${f * meta.fpsIn} fps instead of ${meta.fpsIn} fps` : '2, 4 or 8 times smoother'}`"
+          :class="{ active: factor === f, ready: !!meta }"
+          :disabled="phase === 'running' || probing"
+          :title="meta ? `${f * meta.fpsIn} fps instead of ${meta.fpsIn} fps` : `Smoothness ×${f}`"
           @click="factor = f"
         >
           {{ meta ? `${f * meta.fpsIn} fps` : `${f}×` }}
@@ -74,7 +74,7 @@ import Dropzone from './components/Dropzone.vue';
 import ProgressView from './components/ProgressView.vue';
 import ResultView from './components/ResultView.vue';
 import { FACTORS } from './lib/constants';
-import type { OutputResult, ProcessRequest, WorkerResponse } from './lib/types';
+import type { OutputResult, ProcessRequest, ProbeRequest, WorkerResponse } from './lib/types';
 
 type Phase = 'idle' | 'running' | 'done' | 'error';
 
@@ -83,6 +83,7 @@ const webgpu = ref(false);
 const file = ref<File | null>(null);
 const factor = ref<2 | 4 | 8>(2);
 const phase = ref<Phase>('idle');
+const probing = ref(false);
 const stage = ref<'decode' | 'interpolate' | 'encode'>('decode');
 const pct = ref(0);
 const note = ref('');
@@ -91,6 +92,7 @@ const result = ref<OutputResult | null>(null);
 const meta = ref<{ width: number; height: number; fpsIn: number; fpsOut: number; frames: number } | null>(null);
 
 let worker: Worker | null = null;
+let probeWorker: Worker | null = null;
 let objectUrl: string | null = null;
 
 onMounted(() => {
@@ -99,13 +101,56 @@ onMounted(() => {
 
 onUnmounted(() => {
   worker?.terminate();
+  probeWorker?.terminate();
   if (objectUrl) URL.revokeObjectURL(objectUrl);
 });
 
 function onFile(f: File | null): void {
   file.value = f;
+  phase.value = 'idle';
+  reset();
+  if (f) probeFile(f);
+}
+
+function probeFile(f: File): void {
+  probing.value = true;
   meta.value = null;
-  if (phase.value !== 'running') reset();
+  error.value = '';
+  probeWorker?.terminate();
+
+  const w = new Worker(new URL('./worker/pipeline.worker.ts', import.meta.url), {
+    type: 'module',
+  });
+  probeWorker = w;
+
+  w.onmessage = (ev: MessageEvent<WorkerResponse>) => {
+    const msg = ev.data;
+    if (msg.type === 'meta') {
+      meta.value = { width: msg.width, height: msg.height, fpsIn: msg.fpsIn, fpsOut: msg.fpsOut, frames: msg.frames };
+      if (meta.value.fpsIn * factor.value > 240) factor.value = 2;
+      probing.value = false;
+      stopProbeWorker();
+    } else if (msg.type === 'error') {
+      error.value = msg.message;
+      phase.value = 'error';
+      probing.value = false;
+      stopProbeWorker();
+    }
+  };
+  w.onerror = () => {
+    probing.value = false;
+    stopProbeWorker();
+  };
+
+  void f.arrayBuffer().then((buf) => {
+    const req: ProbeRequest = { type: 'probe', buffer: buf };
+    w.postMessage(req, [req.buffer]);
+  });
+}
+
+function stopProbeWorker(): void {
+  probeWorker?.terminate();
+  probeWorker = null;
 }
 
 function reset(): void {
@@ -115,7 +160,6 @@ function reset(): void {
   }
   result.value = null;
   error.value = '';
-  phase.value = 'idle';
   pct.value = 0;
   stage.value = 'decode';
   note.value = '';
@@ -264,6 +308,10 @@ header {
   color: #fff;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   border-color: transparent;
+}
+
+.factor.ready {
+  min-width: 92px;
 }
 
 .go {

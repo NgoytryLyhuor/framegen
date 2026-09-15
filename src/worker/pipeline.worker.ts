@@ -13,6 +13,7 @@ import {
 } from '../lib/constants';
 import type {
   ProcessRequest,
+  ProbeRequest,
   WorkerResponse,
   InterpFactor,
 } from '../lib/types';
@@ -395,16 +396,40 @@ async function run(req: ProcessRequest): Promise<void> {
   );
 }
 
+async function runProbe(req: ProbeRequest): Promise<void> {
+  const demuxed = await demuxVideo(new Uint8Array(req.buffer), () => cancelled);
+  const sourceFps = Math.min(60, Math.max(1, demuxed.fps));
+
+  if (demuxed.entryType === 'hvc1' || demuxed.entryType === 'hev1') {
+    throw new Error(
+      'This video uses HEVC / H.265, which can’t be interpolated here yet. Convert it to H.264 (e.g. with HandBrake), then try again.',
+    );
+  }
+
+  post({
+    type: 'meta',
+    width: demuxed.width,
+    height: demuxed.height,
+    fpsIn: sourceFps,
+    fpsOut: sourceFps * 2,
+    frames: demuxed.samples.length,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Worker entry
 // ---------------------------------------------------------------------------
 
-workerGlobal.onmessage = (ev: MessageEvent<ProcessRequest>) => {
+type WorkerRequest = ProcessRequest | ProbeRequest;
+
+workerGlobal.onmessage = (ev: MessageEvent<WorkerRequest>) => {
   if (running) return;
   running = true;
   cancelled = false;
 
-  run(ev.data)
+  const task = ev.data.type === 'probe' ? runProbe(ev.data) : run(ev.data);
+
+  task
     .catch((e: unknown) => {
       cancelled = false;
       post({ type: 'error', message: e instanceof Error ? e.message : String(e) });
