@@ -17,8 +17,12 @@
   <Dropzone :file="file" @file="onFile" />
 
   <div v-if="webgpu" class="controls card">
+    <div v-if="probe" class="source">
+      <strong>{{ probe.width }}×{{ probe.height }}</strong> at
+      <strong>{{ probe.fps }} fps</strong> — {{ probe.frames }} frames
+    </div>
     <div class="field">
-      <span class="label">Interpolation</span>
+      <span class="label">Make it this smooth</span>
       <div class="factors">
         <button
           v-for="f in factors"
@@ -26,12 +30,18 @@
           class="factor"
           :class="{ active: factor === f }"
           :disabled="phase === 'running'"
+          :title="`Interpolate real frames so it plays at ${f}× the original frame rate`"
           @click="factor = f"
         >
-          {{ f }}×
+          {{ probe ? `${f * probe.fps} fps` : `${f}×` }}
         </button>
       </div>
     </div>
+    <p v-if="probe" class="how">
+      The smoother the number, the more in-between frames the AI creates.
+      Resolution stays {{ probe.width }}×{{ probe.height }} — only the play
+      speed of the motion changes.
+    </p>
     <button
       class="go"
       :disabled="!file || phase === 'running'"
@@ -67,6 +77,7 @@ import Dropzone from './components/Dropzone.vue';
 import ProgressView from './components/ProgressView.vue';
 import ResultView from './components/ResultView.vue';
 import { FACTORS } from './lib/constants';
+import { probeVideo, type ProbeResult } from './lib/probe';
 import type { OutputResult, ProcessRequest, WorkerResponse } from './lib/types';
 
 type Phase = 'idle' | 'running' | 'done' | 'error';
@@ -81,6 +92,7 @@ const pct = ref(0);
 const note = ref('');
 const error = ref('');
 const result = ref<OutputResult | null>(null);
+const probe = ref<ProbeResult | null>(null);
 
 let worker: Worker | null = null;
 let objectUrl: string | null = null;
@@ -96,6 +108,20 @@ onUnmounted(() => {
 
 function onFile(f: File | null): void {
   file.value = f;
+  probe.value = null;
+  if (f) {
+    void f
+      .arrayBuffer()
+      .then((buf) => {
+        probe.value = probeVideo(buf);
+        if (probe.value && probe.value.fps * factor.value > 240) {
+          factor.value = 2;
+        }
+      })
+      .catch(() => {
+        probe.value = null;
+      });
+  }
   if (phase.value !== 'running') reset();
 }
 
@@ -196,6 +222,22 @@ header {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.source {
+  font-size: 14px;
+  color: var(--text);
+  background: rgba(108, 140, 255, 0.08);
+  border: 1px solid rgba(108, 140, 255, 0.25);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.how {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .field {
