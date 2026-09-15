@@ -13,140 +13,109 @@ export interface DemuxedVideo {
   parseError: string | null;
 }
 
-const CHUNK = 4 * 1024 * 1024;
-
 /**
- * Demux an MP4 incrementally (mp4box fails on very large or fragmented files
- * when the whole buffer is appended at once). Feeds 4 MB slices while yielding
- * to the event loop, sets sample extraction once `moov` is seen, and resolves
- * with video metadata + every video sample.
+ * Demux an MP4 into metadata + every video sample.
+ *
+ * mp4box 0.5.x requires the appended buffer to be an `ArrayBuffer` carrying a
+ * `fileStart` property (0 for the start of the file) and that sample extraction
+ * is enabled from inside `onReady`. Feeding the whole file in one buffer is
+ * both memory-safe (mp4box references the bytes, it never copies them) and
+ * fast — the main cost is just walking the box headers.
  */
 export function demuxVideo(
   buffer: ArrayBuffer,
   isCancelled: () => boolean,
 ): Promise<DemuxedVideo> {
-  return new Promise((resolve, reject) => {
-    const file = MP4Box.createFile();
-    let boxInfo: { videoTracks?: { id: number; timescale?: number }[] } | null = null;
-    let parseError: string | null = null;
-    const samples: MP4Sample[] = [];
+  const file = MP4Box.createFile();
 
-    file.onError = (msg: string) => {
-      parseError = msg || 'MP4 parse error';
-    };
+  let boxInfo: { videoTracks?: { id: number; timescale?: number }[] } | null = null;
+  let parseError: string | null = null;
+  const samples: MP4Sample[] = [];
 
-    file.onReady = (info) => {
-      boxInfo = info;
-    };
+  file.onError = (msg: string) => {
+    parseError = msg || 'MP4 parse error';
+  };
 
-    file.onSamples = (id, _user, batch) => {
-      for (const s of batch) samples.push(s);
+  file.onReady = (info) => {
+    boxInfo = info;
+    const vt = info.videoTracks?.[0];
+    if (vt) {
+      try {
+        file.setExtractionOptions(vt.id, null, { nbSamples: 1000 });
+        file.start();
+      } catch {
+        /* extraction starts on the next parse pass */
+      }
+    }
+  };
+
+  file.onSamples = (id, _user, batch) => {
+    for (const s of batch) samples.push(s);
+    try {
       file.releaseUsedSamples(id, batch.map((s) => s.number));
-    };
+    } catch {
+      /* already released */
+    }
+  };
 
-    const data = new Uint8Array(buffer);
-    let offset = 0;
-    let started = false;
+  return new Promise((resolve, reject) => {
+    if (isCancelled()) {
+      reject(new Error('Processing cancelled.'));
+      return;
+    }
 
-    const fail = (msg: string) => {
-      try {
-        file.stop();
-      } catch {
-        /* noop */
-      }
-      reject(new Error(msg));
-    };
+    try {
+      (buffer as unknown as { fileStart: number }).fileStart = 0;
+      file.appendBuffer(buffer);
+      file.flush();
+    } catch (e) {
+      reject(
+        new Error(parseError ?? (e instanceof Error ? e.message : 'Could not parse this MP4 file.')),
+      );
+      return;
+    }
 
-    const finish = (): void => {
-      try {
-        file.flush();
-      } catch {
-        /* handled by finish checks */
-      }
-      const vt = boxInfo?.videoTracks?.[0];
-      const track = vt ? (file.getTrackById(vt.id) as any) : null;
-      const entry = track?.mdia?.minf?.stbl?.stsd?.entries?.[0] ?? null;
+    if (isCancelled()) {
+      reject(new Error('Processing cancelled.'));
+      return;
+    }
 
-      if (!vt || !entry) {
-        fail(parseError ?? 'No decodable video track found in this MP4 file.');
-        return;
-      }
+    const vt = boxInfo?.videoTracks?.[0];
+    const track = vt ? (file.getTrackById(vt.id) as any) : null;
+    const entry = track?.mdia?.minf?.stbl?.stsd?.entries?.[0] ?? null;
 
-      const timescale = track?.mdia?.mdhd?.timescale ?? vt.timescale ?? 1000;
+    if (!vt || !entry) {
+      reject(
+        new Error(parseError ?? 'No decodable video track found in this MP4 file.'),
+      );
+      return;
+    }
 
-      const cts = samples.map((s) => s.cts).sort((a, b) => a - b);
-      const deltas: number[] = [];
-      for (let i = 1; i < cts.length; i++) {
-        const d = (cts[i] - cts[i - 1]) / timescale;
-        if (d > 0 && d < 1) deltas.push(Math.round(d * 1000) / 1000);
-      }
-      deltas.sort((a, b) => a - b);
-      const fps = deltas.length
-        ? Math.max(1, Math.round(1 / deltas[Math.floor(deltas.length / 2)]))
-        : 30;
-      const durationSec = (cts.length ? cts[cts.length - 1] : 0) / timescale;
+    const timescale = track?.mdia?.mdhd?.timescale ?? vt.timescale ?? 1000;
 
-      resolve({
-        id: vt.id,
-        width: Math.max(16, Math.round(entry.width ?? 1280)),
-        height: Math.max(16, Math.round(entry.height ?? 720)),
-        timescale,
-        fps,
-        durationSec,
-        entryType: typeof entry.type === 'string' ? entry.type : 'avc1',
-        entry,
-        samples,
-        parseError,
-      });
-    };
+    const cts = samples.map((s) => s.cts).sort((a, b) => a - b);
+    const deltas: number[] = [];
+    for (let i = 1; i < cts.length; i++) {
+      const d = (cts[i] - cts[i - 1]) / timescale;
+      if (d > 0 && d < 1) deltas.push(Math.round(d * 1000) / 1000);
+    }
+    deltas.sort((a, b) => a - b);
+    const fps = deltas.length
+      ? Math.max(1, Math.round(1 / deltas[Math.floor(deltas.length / 2)]))
+      : 30;
+    const durationSec = (cts.length ? cts[cts.length - 1] : 0) / timescale;
 
-    const step = (): void => {
-      if (isCancelled()) {
-        fail('Processing cancelled.');
-        return;
-      }
-
-      if (offset >= data.length) {
-        finish();
-        return;
-      }
-
-      const end = Math.min(offset + CHUNK, data.length);
-      const slice = data.slice(offset, end);
-      try {
-        file.appendBuffer(slice);
-      } catch {
-        fail(parseError ?? 'Could not parse this MP4 file.');
-        return;
-      }
-
-      if (boxInfo && !started && boxInfo.videoTracks?.length) {
-        const vt = boxInfo.videoTracks[0];
-        try {
-          file.setExtractionOptions(vt.id, null, { nbSamples: 1000 });
-          file.start();
-          started = true;
-        } catch {
-          /* wait for next chunk */
-        }
-      }
-
-      try {
-        file.flush();
-      } catch {
-        fail(parseError ?? 'Could not parse this MP4 file.');
-        return;
-      }
-      offset = end;
-
-      if (offset >= data.length) {
-        // Give onSamples a tick before finishing.
-        setTimeout(finish, 0);
-      } else {
-        setTimeout(step, 0);
-      }
-    };
-
-    setTimeout(step, 0);
+    resolve({
+      id: vt.id,
+      width: Math.max(16, Math.round(entry.width ?? 1280)),
+      height: Math.max(16, Math.round(entry.height ?? 720)),
+      timescale,
+      fps,
+      durationSec,
+      entryType: typeof entry.type === 'string' ? entry.type : 'avc1',
+      entry,
+      samples,
+      parseError,
+    });
   });
 }

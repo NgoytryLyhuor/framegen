@@ -125,7 +125,7 @@ async function run(req: ProcessRequest): Promise<void> {
 
   // -------------------------------- DEMUX ----------------------------------
   post({ type: 'progress', stage: 'decode', pct: 1, note: 'Reading video…' });
-  const demuxed = await demuxVideo(new Uint8Array(req.buffer), () => cancelled);
+  const demuxed = await demuxVideo(req.buffer, () => cancelled);
 
   const { width: origW, height: origH } = demuxed;
 
@@ -397,7 +397,7 @@ async function run(req: ProcessRequest): Promise<void> {
 }
 
 async function runProbe(req: ProbeRequest): Promise<void> {
-  const demuxed = await demuxVideo(new Uint8Array(req.buffer), () => cancelled);
+  const demuxed = await demuxVideo(req.buffer, () => cancelled);
   const sourceFps = Math.min(60, Math.max(1, demuxed.fps));
 
   if (demuxed.entryType === 'hvc1' || demuxed.entryType === 'hev1') {

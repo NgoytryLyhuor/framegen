@@ -34,7 +34,7 @@ declare module 'mp4box' {
       user: unknown,
       samples: MP4Sample[],
     ) => void;
-    appendBuffer(data: Uint8Array): void;
+    appendBuffer(data: ArrayBuffer & { fileStart?: number }, last?: boolean): void;
     flush(): void;
     start(): void;
     stop(): void;
