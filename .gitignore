@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# copies of model weights (regenerated on install/build)
+public/weights
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+
+# vercel
+.vercel
