@@ -1,5 +1,5 @@
 <template>
-  <div class="dropzone" :class="{ dragging, over }" @dragover.prevent="onDragover" @dragleave="onDragleave" @drop.prevent="onDrop">
+  <div class="dropzone" :class="{ dragging, over }" @dragover.prevent="onDragover" @dragleave="onDragleave" @drop.prevent="onDrop" @click="onClick">
     <input ref="input" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden @change="onPick" />
     <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
       <path d="M3 12h4l2-5 3 10 2.5-6 1.5 1H21" stroke-linecap="round" stroke-linejoin="round" />
