@@ -16,6 +16,15 @@ export type WorkerProgress = {
 
 export type WorkerLog = { type: 'log'; msg: string };
 
+export interface MetaResponse {
+  type: 'meta';
+  width: number;
+  height: number;
+  fpsIn: number;
+  fpsOut: number;
+  frames: number;
+}
+
 export interface DoneResponse {
   type: 'done';
   buffer: ArrayBuffer;
@@ -33,6 +42,7 @@ export type WorkerError = { type: 'error'; message: string };
 export type WorkerResponse =
   | WorkerProgress
   | WorkerLog
+  | MetaResponse
   | DoneResponse
   | WorkerError;
 

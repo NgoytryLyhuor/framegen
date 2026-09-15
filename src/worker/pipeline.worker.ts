@@ -1,6 +1,6 @@
-import MP4Box, { type MP4Sample } from 'mp4box';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { Interpolator } from '../lib/interpolator';
+import { demuxVideo } from '../lib/demux';
 import {
   WEIGHTS_BIN,
   WEIGHTS_MANIFEST,
@@ -123,85 +123,18 @@ async function run(req: ProcessRequest): Promise<void> {
   const data = new Uint8Array(req.buffer);
 
   // -------------------------------- DEMUX ----------------------------------
-  const boxFile = MP4Box.createFile();
-  let demuxError: string | null = null;
+  post({ type: 'progress', stage: 'decode', pct: 1, note: 'Reading video…' });
+  const demuxed = await demuxVideo(new Uint8Array(req.buffer), () => cancelled);
 
-  const state: {
-    videoTrack: any;
-    timescale: number;
-    entry: any;
-    ctsList: number[];
-    videoSamples: MP4Sample[];
-  } = {
-    videoTrack: null,
-    timescale: 1000,
-    entry: null,
-    ctsList: [],
-    videoSamples: [],
-  };
-
-  boxFile.onError = (message) => {
-    demuxError = message || 'MP4 parse error.';
-  };
-
-  boxFile.onReady = (info) => {
-    const vt = info.videoTracks?.[0];
-    if (!vt) {
-      demuxError = 'No video track found in this file.';
-      return;
-    }
-    const track = boxFile.getTrackById(vt.id) as any;
-    state.videoTrack = track;
-    state.timescale = track?.mdia?.mdhd?.timescale ?? vt.timescale ?? 1000;
-    state.entry = track?.mdia?.minf?.stbl?.stsd?.entries?.[0] ?? null;
-    boxFile.setExtractionOptions(vt.id, null, { nbSamples: 1000 });
-    boxFile.start();
-  };
-
-  boxFile.onSamples = (_id, _user, samples) => {
-    for (const s of samples) state.videoSamples.push(s);
-    for (const s of samples) state.ctsList.push(s.cts);
-  };
-
-  try {
-    boxFile.appendBuffer(data);
-    boxFile.flush();
-  } catch {
-    demuxError = demuxError ?? 'Could not parse this MP4 file.';
-  }
-
-  if (demuxError) throw new Error(demuxError);
-
-  const { videoTrack, timescale, videoSamples, ctsList } = state;
-  const entry = state.entry;
-  if (!entry) throw new Error('Could not read codec metadata — is this a valid MP4?');
-
-  const { codec, description, lenBytes } = buildAvcInfo(entry);
-
-  const origW = Math.max(16, Math.round(entry.width ?? 1280));
-  const origH = Math.max(16, Math.round(entry.height ?? 720));
+  const { width: origW, height: origH } = demuxed;
 
   if (origW > MAX_WIDTH || origH > MAX_HEIGHT) {
     throw new Error(
-      `Video is ${origW}×${origH}, above the ${MAX_WIDTH}×${MAX_HEIGHT} safety limit.`,
+      `Video is ${origW}×${origH}, above the ${MAX_WIDTH}×${MAX_HEIGHT} safety limit. Use a smaller clip.`,
     );
   }
 
-  // ------------------------------- TIMING ----------------------------------
-  const fSort = [...ctsList].sort((a, b) => a - b);
-  const deltas: number[] = [];
-  for (let i = 1; i < fSort.length; i++) {
-    const d = (fSort[i] - fSort[i - 1]) / timescale;
-    const rounded = Math.round(d * 1000) / 1000;
-    if (rounded > 0 && rounded < 1) deltas.push(rounded);
-  }
-  deltas.sort((a, b) => a - b);
-  const medianDelta = deltas.length ? deltas[Math.floor(deltas.length / 2)] : 1 / 30;
-  const sourceFps = Math.min(60, Math.max(1, Math.round(1 / medianDelta)));
-  const outFps = sourceFps * factor;
-  const frameDurUs = Math.round((1 / outFps) * 1e6);
-
-  const expected = (videoTrack?.nb_samples as number) ?? videoSamples.length;
+  const expected = demuxed.samples.length;
   if (!expected || expected === 0) {
     throw new Error('No decodable frames found in this video.');
   }
@@ -210,6 +143,28 @@ async function run(req: ProcessRequest): Promise<void> {
       `Video has ${expected} frames (limit ${MAX_ALLOWED_FRAMES}). Use a shorter clip.`,
     );
   }
+
+  if (demuxed.entryType === 'hvc1' || demuxed.entryType === 'hev1') {
+    throw new Error(
+      'This video uses HEVC / H.265, which can’t be interpolated here yet. Convert it to H.264 (e.g. with HandBrake), then try again.',
+    );
+  }
+
+  const { codec, description, lenBytes } = buildAvcInfo(demuxed.entry);
+
+  // ------------------------------- TIMING ----------------------------------
+  const sourceFps = Math.min(60, Math.max(1, demuxed.fps));
+  const outFps = sourceFps * factor;
+  const frameDurUs = Math.round((1 / outFps) * 1e6);
+
+  post({
+    type: 'meta',
+    width: origW,
+    height: origH,
+    fpsIn: sourceFps,
+    fpsOut: outFps,
+    frames: expected,
+  });
 
   post({
     type: 'progress',
@@ -389,14 +344,14 @@ async function run(req: ProcessRequest): Promise<void> {
   post({ type: 'progress', stage: 'decode', pct: 5, note: 'Decoding…' });
 
   let decodeCount = 0;
-  for (const s of videoSamples) {
+  for (const s of demuxed.samples) {
     checkCancelled();
     while (decoder.decodeQueueSize > 10) await sleep(2);
     const au = to4ByteLengthPrefixed(s.data, lenBytes);
     decoder.decode(
       new EncodedVideoChunk({
         type: s.is_sync ? 'key' : 'delta',
-        timestamp: Math.round((s.cts / timescale) * 1e6),
+        timestamp: Math.round((s.cts / demuxed.timescale) * 1e6),
         data: au,
       }),
     );
@@ -432,7 +387,7 @@ async function run(req: ProcessRequest): Promise<void> {
       height: origH,
       fpsIn: sourceFps,
       fpsOut: outFps,
-      durationSec: Math.round((ctsList.length / sourceFps) * 10) / 10,
+      durationSec: Math.round(demuxed.durationSec * 10) / 10,
       framesIn: handled,
       framesOut: emitIdx,
     },
